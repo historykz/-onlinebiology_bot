@@ -1,5 +1,6 @@
 import logging
 import os
+import asyncio
 from html import escape
 from typing import Final
 
@@ -89,6 +90,43 @@ def reply_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
 
 
+async def delete_message_later(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    delay: int = 3,
+) -> None:
+    try:
+        await asyncio.sleep(delay)
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        logger.warning(
+            "Не удалось удалить сообщение %s в чате %s: %s",
+            message_id,
+            chat_id,
+            e,
+        )
+
+
+async def send_temp_reply(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    delay: int = 3,
+    parse_mode: str | None = None,
+) -> None:
+    try:
+        sent = await message.reply_text(text, parse_mode=parse_mode)
+        await delete_message_later(
+            context=context,
+            chat_id=sent.chat_id,
+            message_id=sent.message_id,
+            delay=delay,
+        )
+    except Exception as e:
+        logger.warning("Не удалось отправить временное сообщение: %s", e)
+
+
 async def send_to_all_admins(
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
@@ -133,6 +171,45 @@ async def send_media_to_all_admins(
                 )
         except Exception as e:
             logger.warning("Не удалось отправить %s админу %s: %s", kind, admin_id, e)
+
+
+async def notify_admins_about_admin_reply(
+    context: ContextTypes.DEFAULT_TYPE,
+    replying_admin,
+    target_user_id: int,
+    reply_text: str,
+) -> None:
+    admin_name = escape(replying_admin.full_name or "Без имени")
+    admin_username = (
+        f"@{escape(replying_admin.username)}"
+        if replying_admin.username
+        else "нет"
+    )
+
+    text = (
+        f"👨‍💼 <b>Ответ администратора</b>\n\n"
+        f"<b>Кто ответил:</b> {admin_name}\n"
+        f"<b>Username:</b> {admin_username}\n"
+        f"<b>ID админа:</b> <code>{replying_admin.id}</code>\n"
+        f"<b>Кому ответил:</b> <code>{target_user_id}</code>\n\n"
+        f"<b>Текст ответа:</b>\n{escape(reply_text)}"
+    )
+
+    for admin_id in ADMINS:
+        if admin_id == replying_admin.id:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.warning(
+                "Не удалось отправить уведомление админу %s: %s",
+                admin_id,
+                e,
+            )
 
 
 # =========================================
@@ -213,7 +290,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     admin = query.from_user
     if not admin or not is_admin(admin.id):
-        await query.message.reply_text("Нет доступа.")
+        if query.message:
+            await query.message.reply_text("Нет доступа.")
         return
 
     data = query.data or ""
@@ -221,11 +299,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data.startswith("reply:"):
         user_id = int(data.split(":")[1])
         admin_reply_target[admin.id] = user_id
-        await query.message.reply_text(
-            f"Теперь вы отвечаете пользователю <code>{user_id}</code>.\n"
-            f"Просто отправьте следующее сообщение боту.",
-            parse_mode=ParseMode.HTML,
-        )
+        if query.message:
+            await query.message.reply_text(
+                f"Теперь вы отвечаете пользователю <code>{user_id}</code>.\n"
+                f"Просто отправьте следующее сообщение боту.",
+                parse_mode=ParseMode.HTML,
+            )
 
     elif data.startswith("close:"):
         user_id = int(data.split(":")[1])
@@ -241,10 +320,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception:
             pass
 
-        await query.message.reply_text(
-            f"Диалог с пользователем <code>{user_id}</code> закрыт.",
-            parse_mode=ParseMode.HTML,
-        )
+        if query.message:
+            await query.message.reply_text(
+                f"Диалог с пользователем <code>{user_id}</code> закрыт.",
+                parse_mode=ParseMode.HTML,
+            )
 
 
 # =========================================
@@ -272,7 +352,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 chat_id=target_user_id,
                 text=message.text,
             )
-            await message.reply_text("Ответ отправлен анонимно.")
+
+            await notify_admins_about_admin_reply(
+                context=context,
+                replying_admin=user,
+                target_user_id=target_user_id,
+                reply_text=message.text,
+            )
+
+            await send_temp_reply(
+                message=message,
+                context=context,
+                text="Ответ отправлен анонимно.",
+                delay=3,
+            )
         except Exception as e:
             logger.error("Ошибка отправки ответа: %s", e)
             await message.reply_text("Не удалось отправить ответ.")
@@ -284,7 +377,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "username": user.username,
     }
 
-    await message.reply_text("Ваше сообщение отправлено администрации.")
+    await send_temp_reply(
+        message=message,
+        context=context,
+        text="Ваше сообщение отправлено администрации.",
+        delay=3,
+    )
 
     text = (
         f"{user_card(user)}\n"
@@ -321,8 +419,22 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 photo=message.photo[-1].file_id,
                 caption=message.caption or "",
             )
-            await message.reply_text("Фото отправлено анонимно.")
-        except Exception:
+
+            await notify_admins_about_admin_reply(
+                context=context,
+                replying_admin=user,
+                target_user_id=target_user_id,
+                reply_text=f"[Фото] {message.caption or 'без подписи'}",
+            )
+
+            await send_temp_reply(
+                message=message,
+                context=context,
+                text="Фото отправлено анонимно.",
+                delay=3,
+            )
+        except Exception as e:
+            logger.error("Ошибка отправки фото: %s", e)
             await message.reply_text("Не удалось отправить фото.")
         return
 
@@ -331,7 +443,12 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "username": user.username,
     }
 
-    await message.reply_text("Фото отправлено администрации.")
+    await send_temp_reply(
+        message=message,
+        context=context,
+        text="Фото отправлено администрации.",
+        delay=3,
+    )
 
     caption = (
         f"{user_card(user)}\n"
@@ -371,8 +488,26 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 document=message.document.file_id,
                 caption=message.caption or "",
             )
-            await message.reply_text("Документ отправлен анонимно.")
-        except Exception:
+
+            await notify_admins_about_admin_reply(
+                context=context,
+                replying_admin=user,
+                target_user_id=target_user_id,
+                reply_text=(
+                    f"[Документ] "
+                    f"{message.document.file_name or 'без имени'} | "
+                    f"{message.caption or 'без подписи'}"
+                ),
+            )
+
+            await send_temp_reply(
+                message=message,
+                context=context,
+                text="Документ отправлен анонимно.",
+                delay=3,
+            )
+        except Exception as e:
+            logger.error("Ошибка отправки документа: %s", e)
             await message.reply_text("Не удалось отправить документ.")
         return
 
@@ -381,7 +516,12 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "username": user.username,
     }
 
-    await message.reply_text("Документ отправлен администрации.")
+    await send_temp_reply(
+        message=message,
+        context=context,
+        text="Документ отправлен администрации.",
+        delay=3,
+    )
 
     file_name = escape(message.document.file_name or "без имени")
     caption = (

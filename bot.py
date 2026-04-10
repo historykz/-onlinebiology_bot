@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import os
+import urllib.request
 from html import escape
 from typing import Final
 
@@ -61,16 +63,6 @@ known_users: dict[int, dict] = {}
 
 # Копии сообщений учеников у админов
 # key = (user_id, source_message_id)
-# value = {
-#   "status": {"answered": bool, "admin_label": str | None},
-#   "copies": {
-#       admin_id: {
-#           "kind": "text" | "photo" | "document",
-#           "message_id": int,
-#           "base_text": str
-#       }
-#   }
-# }
 admin_message_copies: dict[tuple[int, int], dict] = {}
 
 
@@ -323,6 +315,34 @@ async def mark_answered(
     )
 
 
+def set_message_reaction_raw(chat_id: int, message_id: int, emoji: str) -> bool:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setMessageReaction"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reaction": [{"type": "emoji", "emoji": emoji}],
+        "is_big": False,
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8")
+            parsed = json.loads(body)
+            logger.info("setMessageReaction response: %s", parsed)
+            return bool(parsed.get("ok"))
+    except Exception as e:
+        logger.warning("Не удалось поставить реакцию: %s", e)
+        return False
+
+
 # =========================================
 # КОМАНДЫ
 # =========================================
@@ -430,27 +450,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not emoji:
             return
 
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"Реакция {emoji}",
-                reply_to_message_id=source_message_id,
-            )
+        ok = set_message_reaction_raw(
+            chat_id=user_id,
+            message_id=source_message_id,
+            emoji=emoji,
+        )
 
-            if query.message:
+        if query.message:
+            if ok:
                 await send_temp_reply(
                     message=query.message,
                     context=context,
                     text=f"Реакция {emoji} поставлена.",
                     delay=3,
                 )
-        except Exception as e:
-            logger.warning("Не удалось отправить реакцию: %s", e)
-            if query.message:
+            else:
                 await send_temp_reply(
                     message=query.message,
                     context=context,
-                    text="Не удалось отправить реакцию.",
+                    text="Не удалось поставить реакцию.",
                     delay=3,
                 )
         return

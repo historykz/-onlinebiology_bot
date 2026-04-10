@@ -1,9 +1,6 @@
-
 import asyncio
-import json
 import logging
 import os
-import urllib.request
 from html import escape
 from typing import Final
 
@@ -53,19 +50,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =========================================
-# ПАМЯТЬ В РАМКАХ ПРОЦЕССА
+# ПАМЯТЬ БОТА
 # =========================================
 
 # admin_id -> (user_id, source_message_id)
 admin_reply_target: dict[int, tuple[int, int]] = {}
 
-# Кто из учеников писал
+# Кто уже писал боту
 known_users: dict[int, dict] = {}
 
-# Копии сообщений ученика у админов
+# Копии сообщений учеников у админов
 # key = (user_id, source_message_id)
 # value = {
-#   "status": {"answered": bool, "admin_label": str},
+#   "status": {"answered": bool, "admin_label": str | None},
 #   "copies": {
 #       admin_id: {
 #           "kind": "text" | "photo" | "document",
@@ -97,6 +94,16 @@ def status_text(answered: bool, who: str | None = None) -> str:
     return "НЕ ОТВЕЧЕНО ❌"
 
 
+def reaction_alias_to_emoji(alias: str) -> str | None:
+    mapping = {
+        "r1": "💞",
+        "r2": "🥲",
+        "r3": "😍",
+        "r4": "🤔",
+    }
+    return mapping.get(alias)
+
+
 def reply_keyboard(user_id: int, source_message_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -109,33 +116,23 @@ def reply_keyboard(user_id: int, source_message_id: int) -> InlineKeyboardMarkup
             [
                 InlineKeyboardButton(
                     "💞",
-                    callback_data=f"react:{user_id}:{source_message_id}:heart"
+                    callback_data=f"react:{user_id}:{source_message_id}:r1"
                 ),
                 InlineKeyboardButton(
                     "🥲",
-                    callback_data=f"react:{user_id}:{source_message_id}:sad"
+                    callback_data=f"react:{user_id}:{source_message_id}:r2"
                 ),
                 InlineKeyboardButton(
                     "😍",
-                    callback_data=f"react:{user_id}:{source_message_id}:love"
+                    callback_data=f"react:{user_id}:{source_message_id}:r3"
                 ),
                 InlineKeyboardButton(
                     "🤔",
-                    callback_data=f"react:{user_id}:{source_message_id}:think"
+                    callback_data=f"react:{user_id}:{source_message_id}:r4"
                 ),
             ],
         ]
     )
-
-
-def reaction_alias_to_emoji(alias: str) -> str | None:
-    mapping = {
-        "heart": "💞",
-        "sad": "🥲",
-        "love": "😍",
-        "think": "🤔",
-    }
-    return mapping.get(alias)
 
 
 def user_card(user) -> str:
@@ -153,6 +150,21 @@ def user_card(user) -> str:
         f"<b>Username:</b> {username}\n"
         f"<b>ID:</b> <code>{user.id}</code>\n"
     )
+
+
+def target_user_label(user_id: int) -> str:
+    data = known_users.get(user_id, {})
+
+    full_name_raw = data.get("full_name") or "Без имени"
+    username_raw = data.get("username")
+
+    full_name = escape(full_name_raw)
+
+    if username_raw:
+        username = f"@{escape(username_raw)}"
+        return f"{full_name} ({username})"
+
+    return f'<a href="tg://user?id={user_id}">{full_name}</a>'
 
 
 async def delete_message_later(
@@ -192,37 +204,33 @@ async def send_temp_reply(
         logger.warning("Не удалось отправить временное сообщение: %s", e)
 
 
-async def notify_admins_about_admin_reply(
-    context: ContextTypes.DEFAULT_TYPE,
-    replying_admin,
-    target_user_id: int,
-    reply_text: str,
-) -> None:
-    who = escape(admin_label(replying_admin))
-
-    text = (
-        f"👨‍💼 <b>Ответ администратора</b>\n\n"
-        f"<b>Кто ответил:</b> {who}\n"
-        f"<b>ID админа:</b> <code>{replying_admin.id}</code>\n"
-        f"<b>Кому ответил:</b> <code>{target_user_id}</code>\n\n"
-        f"<b>Текст ответа:</b>\n{escape(reply_text)}"
-    )
-
-    for admin_id in ADMINS:
-        if admin_id == replying_admin.id:
-            continue
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as e:
-            logger.warning("Не удалось уведомить админа %s: %s", admin_id, e)
-
-
 def build_admin_message(base_text: str, answered: bool, who: str | None = None) -> str:
     return f"{base_text}\n\n<b>Статус:</b> {status_text(answered, who)}"
+
+
+async def store_admin_copy(
+    admin_id: int,
+    kind: str,
+    sent_message_id: int,
+    user_id: int,
+    source_message_id: int,
+    base_text: str,
+) -> None:
+    key = (user_id, source_message_id)
+    if key not in admin_message_copies:
+        admin_message_copies[key] = {
+            "status": {
+                "answered": False,
+                "admin_label": None,
+            },
+            "copies": {},
+        }
+
+    admin_message_copies[key]["copies"][admin_id] = {
+        "kind": kind,
+        "message_id": sent_message_id,
+        "base_text": base_text,
+    }
 
 
 async def refresh_admin_copies(
@@ -266,56 +274,53 @@ async def refresh_admin_copies(
             )
 
 
-def set_message_reaction_raw(chat_id: int, message_id: int, emoji: str) -> bool:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setMessageReaction"
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "reaction": [{"type": "emoji", "emoji": emoji}],
-        "is_big": False,
-    }
+async def notify_admins_about_admin_reply(
+    context: ContextTypes.DEFAULT_TYPE,
+    replying_admin,
+    target_user_id: int,
+    reply_text: str,
+) -> None:
+    who = escape(admin_label(replying_admin))
+    target_label = target_user_label(target_user_id)
 
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    text = (
+        f"👨‍💼 <b>Ответ администратора</b>\n\n"
+        f"<b>Кто ответил:</b> {who}\n"
+        f"<b>ID админа:</b> <code>{replying_admin.id}</code>\n"
+        f"<b>Кому ответил:</b> {target_label}\n\n"
+        f"<b>Текст ответа:</b>\n{escape(reply_text)}"
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = resp.read().decode("utf-8")
-            parsed = json.loads(body)
-            return bool(parsed.get("ok"))
-    except Exception as e:
-        logger.warning("Не удалось поставить реакцию: %s", e)
-        return False
+    for admin_id in ADMINS:
+        if admin_id == replying_admin.id:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.warning("Не удалось уведомить админа %s: %s", admin_id, e)
 
 
-async def store_admin_copy(
-    admin_id: int,
-    kind: str,
-    sent_message_id: int,
-    user_id: int,
+async def mark_answered(
+    context: ContextTypes.DEFAULT_TYPE,
+    replying_admin,
+    target_user_id: int,
     source_message_id: int,
-    base_text: str,
 ) -> None:
-    key = (user_id, source_message_id)
-    if key not in admin_message_copies:
-        admin_message_copies[key] = {
-            "status": {
-                "answered": False,
-                "admin_label": None,
-            },
-            "copies": {},
-        }
+    key = (target_user_id, source_message_id)
+    if key in admin_message_copies:
+        admin_message_copies[key]["status"]["answered"] = True
+        admin_message_copies[key]["status"]["admin_label"] = admin_label(replying_admin)
 
-    admin_message_copies[key]["copies"][admin_id] = {
-        "kind": kind,
-        "message_id": sent_message_id,
-        "base_text": base_text,
-    }
+    await refresh_admin_copies(
+        context=context,
+        user_id=target_user_id,
+        source_message_id=source_message_id,
+    )
 
 
 # =========================================
@@ -355,7 +360,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     admin_reply_target.pop(user.id, None)
-    await update.message.reply_text("Выбор собеседника сброшен.")
+    await update.message.reply_text("Режим ответа выключен.")
 
 
 async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -407,11 +412,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         admin_reply_target[admin.id] = (user_id, source_message_id)
 
         if query.message:
-            await send_temp_reply(
-                message=query.message,
-                context=context,
-                text=f"Вы выбрали пользователя {user_id}. Теперь просто отправьте ему ответ.",
-                delay=3,
+            await query.message.reply_text(
+                f"Режим ответа включён ✅\n"
+                f"Вы отвечаете пользователю <code>{user_id}</code>\n"
+                f"Режим будет активен, пока вы не выберете другого ученика "
+                f"или не отправите /cancel",
+                parse_mode=ParseMode.HTML,
             )
         return
 
@@ -424,25 +430,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not emoji:
             return
 
-        ok = set_message_reaction_raw(
-            chat_id=user_id,
-            message_id=source_message_id,
-            emoji=emoji,
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"Реакция {emoji}",
+                reply_to_message_id=source_message_id,
+            )
 
-        if query.message:
-            if ok:
+            if query.message:
                 await send_temp_reply(
                     message=query.message,
                     context=context,
                     text=f"Реакция {emoji} поставлена.",
                     delay=3,
                 )
-            else:
+        except Exception as e:
+            logger.warning("Не удалось отправить реакцию: %s", e)
+            if query.message:
                 await send_temp_reply(
                     message=query.message,
                     context=context,
-                    text="Не удалось поставить реакцию.",
+                    text="Не удалось отправить реакцию.",
                     delay=3,
                 )
         return
@@ -459,7 +467,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not message or not user or not message.text:
         return
 
-    # Ответ админа ученику
+    # Админ отвечает ученику
     if is_admin(user.id):
         target = admin_reply_target.get(user.id)
         if not target:
@@ -479,14 +487,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 text=message.text,
             )
 
-            key = (target_user_id, source_message_id)
-            if key in admin_message_copies:
-                admin_message_copies[key]["status"]["answered"] = True
-                admin_message_copies[key]["status"]["admin_label"] = admin_label(user)
-
-            await refresh_admin_copies(
+            await mark_answered(
                 context=context,
-                user_id=target_user_id,
+                replying_admin=user,
+                target_user_id=target_user_id,
                 source_message_id=source_message_id,
             )
 
@@ -508,7 +512,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await message.reply_text("Не удалось отправить ответ.")
         return
 
-    # Сообщение ученика
+    # Ученик пишет боту
     known_users[user.id] = {
         "full_name": user.full_name,
         "username": user.username,
@@ -578,14 +582,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 caption=message.caption or "",
             )
 
-            key = (target_user_id, source_message_id)
-            if key in admin_message_copies:
-                admin_message_copies[key]["status"]["answered"] = True
-                admin_message_copies[key]["status"]["admin_label"] = admin_label(user)
-
-            await refresh_admin_copies(
+            await mark_answered(
                 context=context,
-                user_id=target_user_id,
+                replying_admin=user,
+                target_user_id=target_user_id,
                 source_message_id=source_message_id,
             )
 
@@ -678,14 +678,10 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 caption=message.caption or "",
             )
 
-            key = (target_user_id, source_message_id)
-            if key in admin_message_copies:
-                admin_message_copies[key]["status"]["answered"] = True
-                admin_message_copies[key]["status"]["admin_label"] = admin_label(user)
-
-            await refresh_admin_copies(
+            await mark_answered(
                 context=context,
-                user_id=target_user_id,
+                replying_admin=user,
+                target_user_id=target_user_id,
                 source_message_id=source_message_id,
             )
 

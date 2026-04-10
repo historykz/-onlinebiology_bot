@@ -1,7 +1,9 @@
+
+import asyncio
+import json
 import logging
 import os
-import sqlite3
-import asyncio
+import urllib.request
 from html import escape
 from typing import Final
 
@@ -26,7 +28,6 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMINS_RAW = os.getenv("ADMINS", "").strip()
-DB_PATH = os.getenv("DB_PATH", "bot_data.db").strip()
 
 if not BOT_TOKEN:
     raise ValueError("Не найден BOT_TOKEN в Environment Variables")
@@ -51,165 +52,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # =========================================
-# БАЗА SQLITE
+# ПАМЯТЬ В РАМКАХ ПРОЦЕССА
 # =========================================
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# admin_id -> (user_id, source_message_id)
+admin_reply_target: dict[int, tuple[int, int]] = {}
 
+# Кто из учеников писал
+known_users: dict[int, dict] = {}
 
-def init_db() -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            username TEXT
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS admin_targets (
-            admin_id INTEGER PRIMARY KEY,
-            target_user_id INTEGER NOT NULL
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS tickets (
-            ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            is_open INTEGER NOT NULL DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-def save_user(user_id: int, full_name: str, username: str | None) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO users (user_id, full_name, username)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            full_name=excluded.full_name,
-            username=excluded.username
-    """, (user_id, full_name, username))
-    conn.commit()
-    conn.close()
-
-
-def get_all_users() -> list[sqlite3.Row]:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, full_name, username FROM users ORDER BY user_id DESC")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def create_or_get_open_ticket(user_id: int) -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT ticket_id
-        FROM tickets
-        WHERE user_id = ? AND is_open = 1
-        ORDER BY ticket_id DESC
-        LIMIT 1
-    """, (user_id,))
-    row = cur.fetchone()
-
-    if row:
-        ticket_id = row["ticket_id"]
-        cur.execute("""
-            UPDATE tickets
-            SET updated_at = CURRENT_TIMESTAMP
-            WHERE ticket_id = ?
-        """, (ticket_id,))
-    else:
-        cur.execute("""
-            INSERT INTO tickets (user_id, is_open)
-            VALUES (?, 1)
-        """, (user_id,))
-        ticket_id = cur.lastrowid
-
-    conn.commit()
-    conn.close()
-    return ticket_id
-
-
-def close_ticket(ticket_id: int) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE tickets
-        SET is_open = 0,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE ticket_id = ?
-    """, (ticket_id,))
-    conn.commit()
-    conn.close()
-
-
-def get_ticket(ticket_id: int) -> sqlite3.Row | None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT ticket_id, user_id, is_open, created_at, updated_at
-        FROM tickets
-        WHERE ticket_id = ?
-        LIMIT 1
-    """, (ticket_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def set_admin_target(admin_id: int, target_user_id: int) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO admin_targets (admin_id, target_user_id)
-        VALUES (?, ?)
-        ON CONFLICT(admin_id) DO UPDATE SET
-            target_user_id=excluded.target_user_id
-    """, (admin_id, target_user_id))
-    conn.commit()
-    conn.close()
-
-
-def get_admin_target(admin_id: int) -> int | None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT target_user_id
-        FROM admin_targets
-        WHERE admin_id = ?
-        LIMIT 1
-    """, (admin_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row["target_user_id"] if row else None
-
-
-def clear_admin_target(admin_id: int) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM admin_targets WHERE admin_id = ?", (admin_id,))
-    conn.commit()
-    conn.close()
+# Копии сообщений ученика у админов
+# key = (user_id, source_message_id)
+# value = {
+#   "status": {"answered": bool, "admin_label": str},
+#   "copies": {
+#       admin_id: {
+#           "kind": "text" | "photo" | "document",
+#           "message_id": int,
+#           "base_text": str
+#       }
+#   }
+# }
+admin_message_copies: dict[tuple[int, int], dict] = {}
 
 
 # =========================================
@@ -218,6 +83,59 @@ def clear_admin_target(admin_id: int) -> None:
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS
+
+
+def admin_label(user) -> str:
+    if user.username:
+        return f"@{user.username}"
+    return user.full_name or str(user.id)
+
+
+def status_text(answered: bool, who: str | None = None) -> str:
+    if answered and who:
+        return f"ОТВЕЧЕНО ✅ {escape(who)}"
+    return "НЕ ОТВЕЧЕНО ❌"
+
+
+def reply_keyboard(user_id: int, source_message_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✉️ Ответить",
+                    callback_data=f"reply:{user_id}:{source_message_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "💞",
+                    callback_data=f"react:{user_id}:{source_message_id}:heart"
+                ),
+                InlineKeyboardButton(
+                    "🥲",
+                    callback_data=f"react:{user_id}:{source_message_id}:sad"
+                ),
+                InlineKeyboardButton(
+                    "😍",
+                    callback_data=f"react:{user_id}:{source_message_id}:love"
+                ),
+                InlineKeyboardButton(
+                    "🤔",
+                    callback_data=f"react:{user_id}:{source_message_id}:think"
+                ),
+            ],
+        ]
+    )
+
+
+def reaction_alias_to_emoji(alias: str) -> str | None:
+    mapping = {
+        "heart": "💞",
+        "sad": "🥲",
+        "love": "😍",
+        "think": "🤔",
+    }
+    return mapping.get(alias)
 
 
 def user_card(user) -> str:
@@ -234,15 +152,6 @@ def user_card(user) -> str:
         f"<b>Ник:</b> {nick}\n"
         f"<b>Username:</b> {username}\n"
         f"<b>ID:</b> <code>{user.id}</code>\n"
-    )
-
-
-def ticket_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✉️ Ответить", callback_data=f"reply_ticket:{ticket_id}")],
-            [InlineKeyboardButton("🛑 Закрыть диалог", callback_data=f"close_ticket:{ticket_id}")],
-        ]
     )
 
 
@@ -283,69 +192,17 @@ async def send_temp_reply(
         logger.warning("Не удалось отправить временное сообщение: %s", e)
 
 
-async def send_to_all_admins(
-    context: ContextTypes.DEFAULT_TYPE,
-    text: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
-) -> None:
-    for admin_id in ADMINS:
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
-            )
-        except Exception as e:
-            logger.warning("Не удалось отправить сообщение админу %s: %s", admin_id, e)
-
-
-async def send_media_to_all_admins(
-    context: ContextTypes.DEFAULT_TYPE,
-    kind: str,
-    file_id: str,
-    caption: str,
-    ticket_id: int,
-) -> None:
-    for admin_id in ADMINS:
-        try:
-            if kind == "photo":
-                await context.bot.send_photo(
-                    chat_id=admin_id,
-                    photo=file_id,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=ticket_keyboard(ticket_id),
-                )
-            elif kind == "document":
-                await context.bot.send_document(
-                    chat_id=admin_id,
-                    document=file_id,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=ticket_keyboard(ticket_id),
-                )
-        except Exception as e:
-            logger.warning("Не удалось отправить %s админу %s: %s", kind, admin_id, e)
-
-
 async def notify_admins_about_admin_reply(
     context: ContextTypes.DEFAULT_TYPE,
     replying_admin,
     target_user_id: int,
     reply_text: str,
 ) -> None:
-    admin_name = escape(replying_admin.full_name or "Без имени")
-    admin_username = (
-        f"@{escape(replying_admin.username)}"
-        if replying_admin.username
-        else "нет"
-    )
+    who = escape(admin_label(replying_admin))
 
     text = (
         f"👨‍💼 <b>Ответ администратора</b>\n\n"
-        f"<b>Кто ответил:</b> {admin_name}\n"
-        f"<b>Username:</b> {admin_username}\n"
+        f"<b>Кто ответил:</b> {who}\n"
         f"<b>ID админа:</b> <code>{replying_admin.id}</code>\n"
         f"<b>Кому ответил:</b> <code>{target_user_id}</code>\n\n"
         f"<b>Текст ответа:</b>\n{escape(reply_text)}"
@@ -361,11 +218,104 @@ async def notify_admins_about_admin_reply(
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
+            logger.warning("Не удалось уведомить админа %s: %s", admin_id, e)
+
+
+def build_admin_message(base_text: str, answered: bool, who: str | None = None) -> str:
+    return f"{base_text}\n\n<b>Статус:</b> {status_text(answered, who)}"
+
+
+async def refresh_admin_copies(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    source_message_id: int,
+) -> None:
+    key = (user_id, source_message_id)
+    data = admin_message_copies.get(key)
+    if not data:
+        return
+
+    answered = data["status"]["answered"]
+    who = data["status"]["admin_label"]
+
+    for admin_id, copy_data in data["copies"].items():
+        try:
+            new_text = build_admin_message(copy_data["base_text"], answered, who)
+
+            if copy_data["kind"] == "text":
+                await context.bot.edit_message_text(
+                    chat_id=admin_id,
+                    message_id=copy_data["message_id"],
+                    text=new_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_keyboard(user_id, source_message_id),
+                )
+            else:
+                await context.bot.edit_message_caption(
+                    chat_id=admin_id,
+                    message_id=copy_data["message_id"],
+                    caption=new_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_keyboard(user_id, source_message_id),
+                )
+        except Exception as e:
             logger.warning(
-                "Не удалось отправить уведомление админу %s: %s",
+                "Не удалось обновить копию сообщения для админа %s: %s",
                 admin_id,
                 e,
             )
+
+
+def set_message_reaction_raw(chat_id: int, message_id: int, emoji: str) -> bool:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setMessageReaction"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reaction": [{"type": "emoji", "emoji": emoji}],
+        "is_big": False,
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8")
+            parsed = json.loads(body)
+            return bool(parsed.get("ok"))
+    except Exception as e:
+        logger.warning("Не удалось поставить реакцию: %s", e)
+        return False
+
+
+async def store_admin_copy(
+    admin_id: int,
+    kind: str,
+    sent_message_id: int,
+    user_id: int,
+    source_message_id: int,
+    base_text: str,
+) -> None:
+    key = (user_id, source_message_id)
+    if key not in admin_message_copies:
+        admin_message_copies[key] = {
+            "status": {
+                "answered": False,
+                "admin_label": None,
+            },
+            "copies": {},
+        }
+
+    admin_message_copies[key]["copies"][admin_id] = {
+        "kind": kind,
+        "message_id": sent_message_id,
+        "base_text": base_text,
+    }
 
 
 # =========================================
@@ -380,16 +330,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_admin(user.id):
         await update.message.reply_text(
             "Вы вошли как администратор.\n\n"
-            "Команды:\n"
             "/users — кто писал боту\n"
-            "/cancel — отменить текущий режим ответа\n"
+            "/cancel — сбросить выбранного собеседника\n"
             "/id — показать ваш Telegram ID\n\n"
-            "Чтобы ответить ученику, нажмите кнопку «Ответить» под его сообщением."
+            "Нажмите «Ответить» под нужным сообщением ученика."
         )
     else:
         await update.message.reply_text(
             "Здравствуйте.\n"
-            "Напишите ваше сообщение, и администрация увидит его анонимно.\n"
+            "Напишите ваше сообщение, и администрация увидит его.\n"
             "Ответ придёт от имени бота."
         )
 
@@ -405,8 +354,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not user or not is_admin(user.id):
         return
 
-    clear_admin_target(user.id)
-    await update.message.reply_text("Режим ответа отменён.")
+    admin_reply_target.pop(user.id, None)
+    await update.message.reply_text("Выбор собеседника сброшен.")
 
 
 async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -414,19 +363,16 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.message or not user or not is_admin(user.id):
         return
 
-    rows = get_all_users()
-    if not rows:
+    if not known_users:
         await update.message.reply_text("Пока никто не писал.")
         return
 
     lines = ["📋 <b>Пользователи, писавшие боту:</b>\n"]
-    for row in rows:
-        full_name = escape(row["full_name"] or "Без имени")
-        username = row["username"]
+    for uid, data in known_users.items():
+        full_name = escape(data.get("full_name", "Без имени"))
+        username = data.get("username")
         username_text = f"@{escape(username)}" if username else "нет"
-        lines.append(
-            f"• {full_name} | {username_text} | <code>{row['user_id']}</code>"
-        )
+        lines.append(f"• {full_name} | {username_text} | <code>{uid}</code>")
 
     await update.message.reply_text(
         "\n".join(lines),
@@ -453,66 +399,53 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     data = query.data or ""
 
-    if data.startswith("reply_ticket:"):
-        ticket_id = int(data.split(":")[1])
-        ticket = get_ticket(ticket_id)
+    if data.startswith("reply:"):
+        _, user_id_str, source_message_id_str = data.split(":")
+        user_id = int(user_id_str)
+        source_message_id = int(source_message_id_str)
 
-        if not ticket or ticket["is_open"] != 1:
-            if query.message:
-                await query.message.reply_text("Тикет не найден или уже закрыт.")
-            return
-
-        target_user_id = int(ticket["user_id"])
-        set_admin_target(admin.id, target_user_id)
+        admin_reply_target[admin.id] = (user_id, source_message_id)
 
         if query.message:
-            temp = await query.message.reply_text(
-                f"Теперь вы отвечаете пользователю <code>{target_user_id}</code>.\n"
-                f"Тикет: <code>{ticket_id}</code>\n"
-                f"Просто отправьте следующее сообщение боту.",
-                parse_mode=ParseMode.HTML,
-            )
-            await delete_message_later(
+            await send_temp_reply(
+                message=query.message,
                 context=context,
-                chat_id=temp.chat_id,
-                message_id=temp.message_id,
+                text=f"Вы выбрали пользователя {user_id}. Теперь просто отправьте ему ответ.",
                 delay=3,
             )
+        return
 
-    elif data.startswith("close_ticket:"):
-        ticket_id = int(data.split(":")[1])
-        ticket = get_ticket(ticket_id)
+    if data.startswith("react:"):
+        _, user_id_str, source_message_id_str, alias = data.split(":")
+        user_id = int(user_id_str)
+        source_message_id = int(source_message_id_str)
+        emoji = reaction_alias_to_emoji(alias)
 
-        if not ticket:
-            if query.message:
-                await query.message.reply_text("Тикет не найден.")
+        if not emoji:
             return
 
-        user_id = int(ticket["user_id"])
-        close_ticket(ticket_id)
-
-        if get_admin_target(admin.id) == user_id:
-            clear_admin_target(admin.id)
-
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="Диалог завершён. Если нужно, можете написать снова.",
-            )
-        except Exception:
-            pass
+        ok = set_message_reaction_raw(
+            chat_id=user_id,
+            message_id=source_message_id,
+            emoji=emoji,
+        )
 
         if query.message:
-            temp = await query.message.reply_text(
-                f"Диалог с пользователем <code>{user_id}</code> закрыт.",
-                parse_mode=ParseMode.HTML,
-            )
-            await delete_message_later(
-                context=context,
-                chat_id=temp.chat_id,
-                message_id=temp.message_id,
-                delay=3,
-            )
+            if ok:
+                await send_temp_reply(
+                    message=query.message,
+                    context=context,
+                    text=f"Реакция {emoji} поставлена.",
+                    delay=3,
+                )
+            else:
+                await send_temp_reply(
+                    message=query.message,
+                    context=context,
+                    text="Не удалось поставить реакцию.",
+                    delay=3,
+                )
+        return
 
 
 # =========================================
@@ -526,10 +459,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not message or not user or not message.text:
         return
 
-    # Если пишет админ — значит это ответ ученику
+    # Ответ админа ученику
     if is_admin(user.id):
-        target_user_id = get_admin_target(user.id)
-        if not target_user_id:
+        target = admin_reply_target.get(user.id)
+        if not target:
             await send_temp_reply(
                 message=message,
                 context=context,
@@ -538,10 +471,23 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
+        target_user_id, source_message_id = target
+
         try:
             await context.bot.send_message(
                 chat_id=target_user_id,
                 text=message.text,
+            )
+
+            key = (target_user_id, source_message_id)
+            if key in admin_message_copies:
+                admin_message_copies[key]["status"]["answered"] = True
+                admin_message_copies[key]["status"]["admin_label"] = admin_label(user)
+
+            await refresh_admin_copies(
+                context=context,
+                user_id=target_user_id,
+                source_message_id=source_message_id,
             )
 
             await notify_admins_about_admin_reply(
@@ -562,9 +508,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await message.reply_text("Не удалось отправить ответ.")
         return
 
-    # Если пишет ученик
-    save_user(user.id, user.full_name, user.username)
-    ticket_id = create_or_get_open_ticket(user.id)
+    # Сообщение ученика
+    known_users[user.id] = {
+        "full_name": user.full_name,
+        "username": user.username,
+    }
 
     await send_temp_reply(
         message=message,
@@ -573,17 +521,30 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         delay=3,
     )
 
-    text = (
-        f"{user_card(user)}"
-        f"<b>Тикет:</b> <code>{ticket_id}</code>\n\n"
+    base_text = (
+        f"{user_card(user)}\n"
         f"<b>Сообщение:</b>\n{escape(message.text)}"
     )
+    full_text = build_admin_message(base_text, answered=False)
 
-    await send_to_all_admins(
-        context=context,
-        text=text,
-        reply_markup=ticket_keyboard(ticket_id),
-    )
+    for admin_id in ADMINS:
+        try:
+            sent = await context.bot.send_message(
+                chat_id=admin_id,
+                text=full_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_keyboard(user.id, message.message_id),
+            )
+            await store_admin_copy(
+                admin_id=admin_id,
+                kind="text",
+                sent_message_id=sent.message_id,
+                user_id=user.id,
+                source_message_id=message.message_id,
+                base_text=base_text,
+            )
+        except Exception as e:
+            logger.warning("Не удалось отправить сообщение админу %s: %s", admin_id, e)
 
 
 # =========================================
@@ -598,21 +559,34 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if is_admin(user.id):
-        target_user_id = get_admin_target(user.id)
-        if not target_user_id:
+        target = admin_reply_target.get(user.id)
+        if not target:
             await send_temp_reply(
                 message=message,
                 context=context,
-                text="Сначала выберите диалог кнопкой «Ответить».",
+                text="Сначала нажмите «Ответить» под сообщением ученика.",
                 delay=3,
             )
             return
+
+        target_user_id, source_message_id = target
 
         try:
             await context.bot.send_photo(
                 chat_id=target_user_id,
                 photo=message.photo[-1].file_id,
                 caption=message.caption or "",
+            )
+
+            key = (target_user_id, source_message_id)
+            if key in admin_message_copies:
+                admin_message_copies[key]["status"]["answered"] = True
+                admin_message_copies[key]["status"]["admin_label"] = admin_label(user)
+
+            await refresh_admin_copies(
+                context=context,
+                user_id=target_user_id,
+                source_message_id=source_message_id,
             )
 
             await notify_admins_about_admin_reply(
@@ -633,8 +607,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await message.reply_text("Не удалось отправить фото.")
         return
 
-    save_user(user.id, user.full_name, user.username)
-    ticket_id = create_or_get_open_ticket(user.id)
+    known_users[user.id] = {
+        "full_name": user.full_name,
+        "username": user.username,
+    }
 
     await send_temp_reply(
         message=message,
@@ -643,20 +619,32 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         delay=3,
     )
 
-    caption = (
-        f"{user_card(user)}"
-        f"<b>Тикет:</b> <code>{ticket_id}</code>\n\n"
+    base_text = (
+        f"{user_card(user)}\n"
         f"<b>Фото</b>\n"
         f"<b>Подпись:</b> {escape(message.caption or 'без подписи')}"
     )
+    full_caption = build_admin_message(base_text, answered=False)
 
-    await send_media_to_all_admins(
-        context=context,
-        kind="photo",
-        file_id=message.photo[-1].file_id,
-        caption=caption,
-        ticket_id=ticket_id,
-    )
+    for admin_id in ADMINS:
+        try:
+            sent = await context.bot.send_photo(
+                chat_id=admin_id,
+                photo=message.photo[-1].file_id,
+                caption=full_caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_keyboard(user.id, message.message_id),
+            )
+            await store_admin_copy(
+                admin_id=admin_id,
+                kind="photo",
+                sent_message_id=sent.message_id,
+                user_id=user.id,
+                source_message_id=message.message_id,
+                base_text=base_text,
+            )
+        except Exception as e:
+            logger.warning("Не удалось отправить фото админу %s: %s", admin_id, e)
 
 
 # =========================================
@@ -671,21 +659,34 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     if is_admin(user.id):
-        target_user_id = get_admin_target(user.id)
-        if not target_user_id:
+        target = admin_reply_target.get(user.id)
+        if not target:
             await send_temp_reply(
                 message=message,
                 context=context,
-                text="Сначала выберите диалог кнопкой «Ответить».",
+                text="Сначала нажмите «Ответить» под сообщением ученика.",
                 delay=3,
             )
             return
+
+        target_user_id, source_message_id = target
 
         try:
             await context.bot.send_document(
                 chat_id=target_user_id,
                 document=message.document.file_id,
                 caption=message.caption or "",
+            )
+
+            key = (target_user_id, source_message_id)
+            if key in admin_message_copies:
+                admin_message_copies[key]["status"]["answered"] = True
+                admin_message_copies[key]["status"]["admin_label"] = admin_label(user)
+
+            await refresh_admin_copies(
+                context=context,
+                user_id=target_user_id,
+                source_message_id=source_message_id,
             )
 
             await notify_admins_about_admin_reply(
@@ -710,8 +711,10 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await message.reply_text("Не удалось отправить документ.")
         return
 
-    save_user(user.id, user.full_name, user.username)
-    ticket_id = create_or_get_open_ticket(user.id)
+    known_users[user.id] = {
+        "full_name": user.full_name,
+        "username": user.username,
+    }
 
     await send_temp_reply(
         message=message,
@@ -721,20 +724,32 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
     file_name = escape(message.document.file_name or "без имени")
-    caption = (
-        f"{user_card(user)}"
-        f"<b>Тикет:</b> <code>{ticket_id}</code>\n\n"
+    base_text = (
+        f"{user_card(user)}\n"
         f"<b>Документ:</b> {file_name}\n"
         f"<b>Подпись:</b> {escape(message.caption or 'без подписи')}"
     )
+    full_caption = build_admin_message(base_text, answered=False)
 
-    await send_media_to_all_admins(
-        context=context,
-        kind="document",
-        file_id=message.document.file_id,
-        caption=caption,
-        ticket_id=ticket_id,
-    )
+    for admin_id in ADMINS:
+        try:
+            sent = await context.bot.send_document(
+                chat_id=admin_id,
+                document=message.document.file_id,
+                caption=full_caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_keyboard(user.id, message.message_id),
+            )
+            await store_admin_copy(
+                admin_id=admin_id,
+                kind="document",
+                sent_message_id=sent.message_id,
+                user_id=user.id,
+                source_message_id=message.message_id,
+                base_text=base_text,
+            )
+        except Exception as e:
+            logger.warning("Не удалось отправить документ админу %s: %s", admin_id, e)
 
 
 # =========================================
@@ -742,8 +757,6 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # =========================================
 
 def main() -> None:
-    init_db()
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))

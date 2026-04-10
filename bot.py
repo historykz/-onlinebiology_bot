@@ -89,9 +89,9 @@ def status_text(answered: bool, who: str | None = None) -> str:
 def reaction_alias_to_emoji(alias: str) -> str | None:
     mapping = {
         "r1": "💞",
-        "r2": "🥲",
-        "r3": "😍",
-        "r4": "🤔",
+        "r2": "🧐",
+        "r3": "👍",
+        "r4": "❤️",
     }
     return mapping.get(alias)
 
@@ -111,15 +111,15 @@ def reply_keyboard(user_id: int, source_message_id: int) -> InlineKeyboardMarkup
                     callback_data=f"react:{user_id}:{source_message_id}:r1"
                 ),
                 InlineKeyboardButton(
-                    "🥲",
+                    "🧐",
                     callback_data=f"react:{user_id}:{source_message_id}:r2"
                 ),
                 InlineKeyboardButton(
-                    "😍",
+                    "👍",
                     callback_data=f"react:{user_id}:{source_message_id}:r3"
                 ),
                 InlineKeyboardButton(
-                    "🤔",
+                    "❤️",
                     callback_data=f"react:{user_id}:{source_message_id}:r4"
                 ),
             ],
